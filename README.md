@@ -15,7 +15,7 @@ its respective owners because anyone can speak HTTP.
 # Usage
 
     $ make
-    $ ./parrot --irc-server=irc.corp.com --http-address=:8080 --default-channel=ops
+    $ ./parrot example_config.yml
     $ curl http://localhost:8080/  # show further instructions
 
     $ curl -XPOST http://localhost:8080/post/ops -d "msg=INFO: The roof is on fire."

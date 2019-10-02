@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
-	"flag"
 	"fmt"
+	"gopkg.in/yaml.v2"
 	"html/template"
 	"io/ioutil"
 	"log"
@@ -20,16 +20,16 @@ import (
 
 const CONN_RETRY_DELAY = 3
 
-var (
-	useSyslog      = flag.Bool("syslog", false, "Log to syslog")
-	nick           = flag.String("nick", "parrot", "bot's nickname")
-	nickPassword   = flag.String("nickpassword", "", "nickserv password")
-	ircAddress     = flag.String("irc-address", "irc.freenode.net", "IRC server address")
-	ircSSL         = flag.Bool("ssl", false, "Connect with SSL")
-	defaultChannel = flag.String("default-channel", "parrot", "default channel for messages, and initial channel")
-	httpAddress    = flag.String("http-address", ":5555", "TCP address of the HTTP server")
-	httpURL        = flag.String("http-url", "", "HTTP URL to contact the bot, and to post message")
-)
+type Config struct {
+	UseSyslog      bool   `yaml:"useSyslog"`
+	Nick           string `yaml:"nick"`
+	NickPassword   string `yaml:"nickPassword"`
+	IrcAddress     string `yaml:"ircAddress"`
+	IrcSSL         bool   `yaml:"ircSSL"`
+	DefaultChannel string `yaml:"defaultChannel"`
+	HttpAddress    string `yaml:"httpAddress"`
+	HttpURL        string `yaml:"httpURL"`
+}
 
 // The struct going from the HTTP go routine to the IRC channel by the Bridge chan
 type ChannelMessage struct {
@@ -38,9 +38,9 @@ type ChannelMessage struct {
 }
 
 type IRCBridge struct {
-	Client     *irc.Conn
-	Bridge     chan ChannelMessage
-	IrcAddress string
+	Client *irc.Conn
+	Bridge chan ChannelMessage
+	config *Config
 }
 
 func (irc *IRCBridge) Channels() []string {
@@ -120,10 +120,10 @@ func (irc *IRCBridge) connectRetry() {
 }
 
 func (irc *IRCBridge) connect() (err error) {
-	log.Printf("Connecting to IRC %s", irc.IrcAddress)
+	log.Printf("Connecting to IRC %s", irc.config.IrcAddress)
 
-	irc.Client.Config().Server = irc.IrcAddress
-	if *ircSSL {
+	irc.Client.Config().Server = irc.config.IrcAddress
+	if irc.config.IrcSSL {
 		irc.Client.Config().SSL = true
 		irc.Client.Config().SSLConfig = &tls.Config{InsecureSkipVerify: true}
 	}
@@ -133,14 +133,42 @@ func (irc *IRCBridge) connect() (err error) {
 	return
 }
 
-func main() {
-	flag.Parse()
-
-	if *httpURL == "" {
-		log.Fatal("Please specify the HTTP URL for the end user to use -http-url=...")
+func loadConfig() *Config {
+	config := &Config{
+		UseSyslog:      false,
+		Nick:           "parrot",
+		IrcAddress:     "irc.freenode.net",
+		IrcSSL:         true,
+		DefaultChannel: "parrot",
+		HttpAddress:    ":5555",
 	}
 
-	if *useSyslog {
+	if len(os.Args) < 2 {
+		log.Fatal("Missing config file")
+	}
+
+	f, err := os.Open(os.Args[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	decoder := yaml.NewDecoder(f)
+	if err := decoder.Decode(config); err != nil {
+		log.Fatal(err)
+	}
+
+	return config
+}
+
+func main() {
+	config := loadConfig()
+
+	if config.HttpURL == "" {
+		log.Fatal("Please specify the HTTP URL for the end user to use httpUrl:...")
+	}
+
+	if config.UseSyslog {
 		sl, err := syslog.New(syslog.LOG_INFO, "parrot")
 		if err != nil {
 			log.Fatalf("Can't initialize syslog: %v", err)
@@ -156,24 +184,24 @@ func main() {
 	}
 
 	// create new IRC connection
-	c := irc.SimpleClient(*nick, *nick)
+	c := irc.SimpleClient(config.Nick, config.Nick)
 
-	parrot := IRCBridge{c, make(chan ChannelMessage), *ircAddress}
+	parrot := IRCBridge{c, make(chan ChannelMessage), config}
 
 	// keep track of channels we're on (and much more we don't need)
 	c.EnableStateTracking()
 
 	c.HandleFunc("connected",
 		func(conn *irc.Conn, line *irc.Line) {
-			conn.Join(fmt.Sprintf("#%s", *defaultChannel))
+			conn.Join(fmt.Sprintf("#%s", config.DefaultChannel))
 			log.Printf("Connected")
-			if len(*nickPassword) > 0 {
-				conn.Privmsg("NickServ", "IDENTIFY "+*nickPassword)
+			if len(config.NickPassword) > 0 {
+				conn.Privmsg("NickServ", "IDENTIFY "+config.NickPassword)
 			}
 		})
 	c.HandleFunc("disconnected",
 		func(conn *irc.Conn, line *irc.Line) {
-			conn.Join(fmt.Sprintf("#%s", *defaultChannel))
+			conn.Join(fmt.Sprintf("#%s", config.DefaultChannel))
 			log.Printf("Oops got disconnected, retrying to connect...")
 			go parrot.connectRetry()
 		})
@@ -187,9 +215,9 @@ func main() {
 		func(conn *irc.Conn, line *irc.Line) {
 			channel := line.Args[0]
 			message := line.Args[1]
-			standardDisclaimer := fmt.Sprintf("I'm not very smart, see %s", *httpURL)
+			standardDisclaimer := fmt.Sprintf("I'm not very smart, see %s", config.HttpURL)
 			r, err := regexp.Compile(fmt.Sprintf("(?i:%s|%s|parrot)(?::|,)",
-				regexp.QuoteMeta(*nick),
+				regexp.QuoteMeta(config.Nick),
 				regexp.QuoteMeta(conn.Me().Nick)))
 			if err != nil {
 				log.Printf("err: %s, %s\n", conn.Me().Nick, err)
@@ -219,9 +247,9 @@ func main() {
 		}{
 			parrot.Client.Me().Nick,
 			parrot.Channels(),
-			*httpURL,
-			*httpAddress,
-			parrot.IrcAddress,
+			config.HttpURL,
+			config.HttpAddress,
+			parrot.config.IrcAddress,
 		}
 		t.Execute(w, home)
 	})
@@ -231,12 +259,12 @@ func main() {
 		lenPath := len("/post/")
 		channel := r.URL.Path[lenPath:]
 		if len(strings.TrimSpace(channel)) == 0 {
-			channel = *defaultChannel
+			channel = config.DefaultChannel
 		}
 		parrot.ReceiveHTTPMessage(w, r, channel)
 	})
 	http.HandleFunc("/post", func(w http.ResponseWriter, r *http.Request) {
-		parrot.ReceiveHTTPMessage(w, r, *defaultChannel)
+		parrot.ReceiveHTTPMessage(w, r, config.DefaultChannel)
 	})
 
 	// start receiver
@@ -248,8 +276,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Printf("HTTP server running at %s", *httpAddress)
-	httpErr := http.ListenAndServe(*httpAddress, nil)
+	log.Printf("HTTP server running at %s", config.HttpAddress)
+	httpErr := http.ListenAndServe(config.HttpAddress, nil)
 	if httpErr != nil {
 		log.Fatalf("HTTP error: %s", httpErr)
 	}

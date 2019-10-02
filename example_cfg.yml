@@ -1,0 +1,8 @@
+useSyslog: false
+nick: parrot
+nickPassword: ""
+ircAddress: irc.freenode.net
+ircSSL: true
+defaultChannel: parrot
+httpAddress: :5555
+httpURL: http://localhost:8080/
