@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"gopkg.in/yaml.v2"
 	"html/template"
@@ -21,26 +22,36 @@ import (
 const CONN_RETRY_DELAY = 3
 
 type Config struct {
-	UseSyslog      bool   `yaml:"useSyslog"`
-	Nick           string `yaml:"nick"`
-	NickPassword   string `yaml:"nickPassword"`
-	IrcAddress     string `yaml:"ircAddress"`
-	IrcSSL         bool   `yaml:"ircSSL"`
-	DefaultChannel string `yaml:"defaultChannel"`
-	HttpAddress    string `yaml:"httpAddress"`
-	HttpURL        string `yaml:"httpURL"`
+	UseSyslog       bool   `yaml:"useSyslog"`
+	Nick            string `yaml:"nick"`
+	NickPassword    string `yaml:"nickPassword"`
+	IrcAddress      string `yaml:"ircAddress"`
+	IrcSSL          bool   `yaml:"ircSSL"`
+	DefaultEndpoint string `yaml:"defaultEndpoint"`
+	HttpAddress     string `yaml:"httpAddress"`
+	HttpURL         string `yaml:"httpURL"`
+	Endpoint        map[string]struct {
+		Target string
+		Fmt    string
+	} `yaml:"endpoints"`
 }
 
-// The struct going from the HTTP go routine to the IRC channel by the Bridge chan
-type ChannelMessage struct {
-	Channel string
+// The struct going from the HTTP go routine to the IRC target by the Bridge chan
+type IRCMessage struct {
+	Target  string
 	Message []byte
 }
 
+type IRCEndpoint struct {
+	target   string
+	template *template.Template
+}
+
 type IRCBridge struct {
-	Client *irc.Conn
-	Bridge chan ChannelMessage
-	config *Config
+	Client   *irc.Conn
+	Bridge   chan IRCMessage
+	config   *Config
+	endpoint map[string]IRCEndpoint
 }
 
 func (irc *IRCBridge) Channels() []string {
@@ -55,29 +66,35 @@ func (irc *IRCBridge) Channels() []string {
 func (irc *IRCBridge) recv() {
 	for {
 		msg := <-irc.Bridge
-		channel := fmt.Sprintf("#%s", msg.Channel)
 		for _, line := range bytes.Split(msg.Message, []byte("\n")) {
 			strMsg := fmt.Sprintf("%s", line)
-			irc.Emit(channel, strMsg)
+			irc.Emit(msg.Target, strMsg)
 		}
 	}
 }
 
-func (irc *IRCBridge) Emit(channel string, message string) {
+func (irc *IRCBridge) Emit(target string, message string) {
 	// join channels we don't track
-	if _, isOn := irc.Client.StateTracker().IsOn(channel, irc.Client.Me().Nick); !isOn {
-		log.Println("Joining", channel)
-		irc.Client.Join(channel)
+	if _, isOn := irc.Client.StateTracker().IsOn(target, irc.Client.Me().Nick); !isOn && strings.HasPrefix(target, "#") {
+		log.Println("Joining", target)
+		irc.Client.Join(target)
 	}
-	irc.Client.Privmsg(channel, message)
+	irc.Client.Privmsg(target, message)
 }
 
-func (irc *IRCBridge) ReceiveHTTPMessage(w http.ResponseWriter, r *http.Request, channel string) {
+func (irc *IRCBridge) ReceiveHTTPMessage(w http.ResponseWriter, r *http.Request, endpointName string) {
 	var msg []byte
 	if r.Method != "POST" {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
+
+	ircEndpoint, endpointExists := irc.endpoint[endpointName]
+	if !endpointExists {
+		http.Error(w, "Endpoint not found", 404)
+		return
+	}
+
 	ct := r.Header.Get("Content-Type")
 	if ct == "application/x-www-form-urlencoded" || ct == "multipart/form-data" {
 		msg = []byte(strings.TrimSpace(r.FormValue("msg")))
@@ -94,11 +111,29 @@ func (irc *IRCBridge) ReceiveHTTPMessage(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
+	// Template rendering
+	if ircEndpoint.template != nil {
+		jsonData := map[string]interface{}{}
+		if err := json.Unmarshal(msg, &jsonData); err != nil {
+			http.Error(w, "Unable to parse JSON data", 400)
+			return
+		}
+
+		buf := new(bytes.Buffer)
+		if err := ircEndpoint.template.Execute(buf, jsonData); err != nil {
+			log.Printf("Template %s execution failed: %v", endpointName, err)
+			http.Error(w, "Internal server error", 500)
+			return
+		}
+
+		msg = buf.Bytes()
+	}
+
 	// Can't acknowledge this message
 	if !irc.Client.Connected() {
 		log.Printf("Couldn't send '%s' to channel %s on behalf of %s",
 			bytes.Replace(msg, []byte("\n"), []byte("\\n"), -1),
-			channel,
+			ircEndpoint.target,
 			r.RemoteAddr)
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", CONN_RETRY_DELAY*2))
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -108,8 +143,8 @@ func (irc *IRCBridge) ReceiveHTTPMessage(w http.ResponseWriter, r *http.Request,
 	log.Printf("%s sent '%s' to channel %s",
 		r.RemoteAddr,
 		bytes.Replace(msg, []byte("\n"), []byte("\\n"), -1),
-		channel)
-	irc.Bridge <- ChannelMessage{channel, msg}
+		ircEndpoint.target)
+	irc.Bridge <- IRCMessage{ircEndpoint.target, msg}
 }
 
 func (irc *IRCBridge) connectRetry() {
@@ -135,12 +170,11 @@ func (irc *IRCBridge) connect() (err error) {
 
 func loadConfig() *Config {
 	config := &Config{
-		UseSyslog:      false,
-		Nick:           "parrot",
-		IrcAddress:     "irc.freenode.net",
-		IrcSSL:         true,
-		DefaultChannel: "parrot",
-		HttpAddress:    ":5555",
+		UseSyslog:   false,
+		Nick:        "parrot",
+		IrcAddress:  "irc.freenode.net",
+		IrcSSL:      true,
+		HttpAddress: ":5555",
 	}
 
 	if len(os.Args) < 2 {
@@ -183,17 +217,34 @@ func main() {
 		panic(err)
 	}
 
+	ircEndpoint := make(map[string]IRCEndpoint)
+	for endpointName, endpointConf := range config.Endpoint {
+		var err error
+		v := IRCEndpoint{target: endpointConf.Target}
+		if endpointConf.Fmt != "" {
+			v.template, err = template.New(endpointName).Parse(endpointConf.Fmt)
+			if err != nil {
+				log.Fatalf("Unable to parse template for %s: %v", endpointName, err)
+			}
+		}
+		ircEndpoint[endpointName] = v
+	}
+
+	if _, exist := ircEndpoint[config.DefaultEndpoint]; !exist {
+		log.Fatal("Configuration error - default endpoint does not exist")
+	}
+
 	// create new IRC connection
 	c := irc.SimpleClient(config.Nick, config.Nick)
 
-	parrot := IRCBridge{c, make(chan ChannelMessage), config}
+	parrot := IRCBridge{c, make(chan IRCMessage), config, ircEndpoint}
 
 	// keep track of channels we're on (and much more we don't need)
 	c.EnableStateTracking()
 
 	c.HandleFunc("connected",
 		func(conn *irc.Conn, line *irc.Line) {
-			conn.Join(fmt.Sprintf("#%s", config.DefaultChannel))
+			conn.Join(ircEndpoint[config.DefaultEndpoint].target)
 			log.Printf("Connected")
 			if len(config.NickPassword) > 0 {
 				conn.Privmsg("NickServ", "IDENTIFY "+config.NickPassword)
@@ -201,7 +252,7 @@ func main() {
 		})
 	c.HandleFunc("disconnected",
 		func(conn *irc.Conn, line *irc.Line) {
-			conn.Join(fmt.Sprintf("#%s", config.DefaultChannel))
+			conn.Join(ircEndpoint[config.DefaultEndpoint].target)
 			log.Printf("Oops got disconnected, retrying to connect...")
 			go parrot.connectRetry()
 		})
@@ -257,14 +308,14 @@ func main() {
 	// Message handlers
 	http.HandleFunc("/post/", func(w http.ResponseWriter, r *http.Request) {
 		lenPath := len("/post/")
-		channel := r.URL.Path[lenPath:]
-		if len(strings.TrimSpace(channel)) == 0 {
-			channel = config.DefaultChannel
+		dest := r.URL.Path[lenPath:]
+		if len(strings.TrimSpace(dest)) == 0 {
+			dest = config.DefaultEndpoint
 		}
-		parrot.ReceiveHTTPMessage(w, r, channel)
+		parrot.ReceiveHTTPMessage(w, r, dest)
 	})
 	http.HandleFunc("/post", func(w http.ResponseWriter, r *http.Request) {
-		parrot.ReceiveHTTPMessage(w, r, config.DefaultChannel)
+		parrot.ReceiveHTTPMessage(w, r, config.DefaultEndpoint)
 	})
 
 	// start receiver

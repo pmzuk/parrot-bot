@@ -3,6 +3,13 @@ nick: parrot
 nickPassword: ""
 ircAddress: irc.freenode.net
 ircSSL: true
-defaultChannel: parrot
+defaultEndpoint: default
 httpAddress: :5555
 httpURL: http://localhost:8080/
+endpoints:
+  default:
+    target: "#chan1"
+  grafana:
+    target: "someNick"
+    fmt: "{{.title}} {{.ruleUrl}}"
+
